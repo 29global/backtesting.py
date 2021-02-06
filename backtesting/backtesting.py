@@ -9,17 +9,20 @@ import multiprocessing as mp
 import os
 import sys
 import warnings
-from abc import abstractmethod, ABCMeta
+from abc import ABCMeta, abstractmethod
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import copy
 from functools import lru_cache, partial
-from itertools import repeat, product, chain, compress
+from itertools import chain, compress, product, repeat
 from math import copysign
 from numbers import Number
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 
 import numpy as np
 import pandas as pd
+
+from ._plotting import plot
+from ._util import _as_str, _Data, _data_period, _Indicator, try_
 
 try:
     from tqdm.auto import tqdm as _tqdm
@@ -28,8 +31,6 @@ except ImportError:
     def _tqdm(seq, **_):
         return seq
 
-from ._plotting import plot
-from ._util import _as_str, _Indicator, _Data, _data_period, try_
 
 __pdoc__ = {
     'Strategy.__init__': False,
@@ -600,19 +601,19 @@ class Trade:
     @property
     def pl(self):
         """Trade profit (positive) or loss (negative) in cash units."""
-        price = self.__exit_price or self.__broker.last_price
+        price = self.__exit_price or self.__broker.last_price(self.__size)
         return self.__size * (price - self.__entry_price)
 
     @property
     def pl_pct(self):
         """Trade profit (positive) or loss (negative) in percent."""
-        price = self.__exit_price or self.__broker.last_price
+        price = self.__exit_price or self.__broker.last_price(self.__size)
         return copysign(1, self.__size) * (price / self.__entry_price - 1)
 
     @property
     def value(self):
         """Trade total value in cash (volume × price)."""
-        price = self.__exit_price or self.__broker.last_price
+        price = self.__exit_price or self.__broker.last_price(self.__size)
         return abs(self.__size) * price
 
     # SL/TP management API
@@ -662,7 +663,7 @@ class Trade:
 
 class _Broker:
     def __init__(self, *, data, cash, commission, margin,
-                 trade_on_close, hedging, exclusive_orders, index):
+                 trade_on_close, hedging, exclusive_orders, index, fee_rate):
         assert 0 < cash, f"cash should be >0, is {cash}"
         assert 0 <= commission < .1, f"commission should be between 0-10%, is {commission}"
         assert 0 < margin <= 1, f"margin should be between 0 and 1, is {margin}"
@@ -673,6 +674,8 @@ class _Broker:
         self._trade_on_close = trade_on_close
         self._hedging = hedging
         self._exclusive_orders = exclusive_orders
+        self._fee_rate = fee_rate
+        self._fees = 0.0
 
         self._equity = np.tile(np.nan, len(index))
         self.orders: List[Order] = []
@@ -733,21 +736,29 @@ class _Broker:
 
         return order
 
-    @property
-    def last_price(self) -> float:
+    def last_price(self, size=None) -> float:
         """ Price at the last (current) close. """
-        return self._data.Close[-1]
+        # TODO: Setup something here which takes either bid or ask column or something
+        price = self._data.Close[-1]
+        if size < 0:
+            price = self._data.Bid[-1]
+        elif size > 0:
+            price = self._data.Ask[-1]
+        return price
 
     def _adjusted_price(self, size=None, price=None) -> float:
         """
         Long/short `price`, adjusted for commisions.
         In long positions, the adjusted price is a fraction higher, and vice versa.
         """
-        return (price or self.last_price) * (1 + copysign(self._commission, size))
+        return (price or self.last_price(size)) * (1 + copysign(self._commission, size))
 
     @property
     def equity(self) -> float:
-        return self._cash + sum(trade.pl for trade in self.trades)
+        total_pnl = sum(trade.pl for trade in self.trades)
+        total_fees = sum(trade.value for trade in self.trades) * self._fee_rate
+        self._fees = self._fees + total_fees
+        return self._cash + total_pnl - total_fees
 
     @property
     def margin_available(self) -> float:
@@ -984,7 +995,8 @@ class Backtest:
                  margin: float = 1.,
                  trade_on_close=False,
                  hedging=False,
-                 exclusive_orders=False
+                 exclusive_orders=False,
+                 fee_rate: float = 0.0,
                  ):
         """
         Initialize a backtest. Requires data and a strategy to test.
@@ -1083,7 +1095,7 @@ class Backtest:
         self._broker = partial(
             _Broker, cash=cash, commission=commission, margin=margin,
             trade_on_close=trade_on_close, hedging=hedging,
-            exclusive_orders=exclusive_orders, index=data.index,
+            exclusive_orders=exclusive_orders, index=data.index, fee_rate=fee_rate,
         )
         self._strategy = strategy
         self._results = None
@@ -1122,6 +1134,9 @@ class Backtest:
             Profit Factor                         2.08802
             Expectancy [%]                        8.79171
             SQN                                  0.916893
+            Entry Fees                               6.00
+            Exit Fees                                6.00
+            Total Fees                              12.00
             _strategy                            SmaCross
             _equity_curve                           Eq...
             _trades                       Size  EntryB...
@@ -1530,6 +1545,8 @@ class Backtest:
         pl = trades_df['PnL']
         returns = trades_df['ReturnPct']
         durations = trades_df['Duration']
+        entry_fees = trades_df['Size'] * trades_df['EntryPrice']
+        exit_fees = trades_df['Size'] * trades_df['ExitPrice']
 
         def _round_timedelta(value, _period=_data_period(index)):
             if not isinstance(value, pd.Timedelta):
@@ -1599,6 +1616,9 @@ class Backtest:
         s.loc['Profit Factor'] = returns[returns > 0].sum() / (abs(returns[returns < 0].sum()) or np.nan)  # noqa: E501
         s.loc['Expectancy [%]'] = returns.mean() * 100
         s.loc['SQN'] = np.sqrt(n_trades) * pl.mean() / (pl.std() or np.nan)
+        s.loc['Entry Fees'] = np.sum(entry_fees)
+        s.loc['Exit Fees'] = np.sum(exit_fees)
+        s.loc['Total Fees'] = np.sum(entry_fees) + np.sum(exit_fees)
 
         s.loc['_strategy'] = strategy
         s.loc['_equity_curve'] = equity_df
