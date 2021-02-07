@@ -1099,6 +1099,7 @@ class Backtest:
         )
         self._strategy = strategy
         self._results = None
+        self._fee_rate = fee_rate
 
     def run(self, **kwargs) -> pd.Series:
         """
@@ -1545,8 +1546,8 @@ class Backtest:
         pl = trades_df['PnL']
         returns = trades_df['ReturnPct']
         durations = trades_df['Duration']
-        entry_fees = trades_df['Size'] * trades_df['EntryPrice']
-        exit_fees = trades_df['Size'] * trades_df['ExitPrice']
+        entry_fees = (trades_df['Size'] * trades_df['EntryPrice']) * self._fee_rate
+        exit_fees = (trades_df['Size'] * trades_df['ExitPrice']) * self._fee_rate
 
         def _round_timedelta(value, _period=_data_period(index)):
             if not isinstance(value, pd.Timedelta):
